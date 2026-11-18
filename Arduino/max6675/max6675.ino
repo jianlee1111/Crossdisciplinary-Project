@@ -20,8 +20,9 @@ void setup() {
 }
 
 void loop() {
-  float t = tc.temperature();            // °C, NAN при ошибке
+  float t = tc.temperature();
+  Serial.print(millis() / 1000.0, 2); Serial.print(F(" s, "));
   if (t == t) { Serial.print(t, 2); Serial.println(F(" C")); }
-  else Serial.println(tc.errorText());   // обрыв, замыкание, нет модуля
-  delay(1000);
+  else Serial.println(tc.errorText());
+  delay(500);
 }
