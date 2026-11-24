@@ -1,4 +1,4 @@
-# CDP 센서 로거 사용법 (cdp_logger.py) 
+# CDP 센서 로거 사용법 (arduino_logger.py) 
 
 ## 1. 준비 (처음 한 번)
 
@@ -21,7 +21,7 @@
 
 1. 아두이노 시리얼 모니터를 닫는다. (포트는 한 프로그램만 열 수 있음)
 2. `sensor_log` 폴더 주소창에 `cmd`를 치고 Enter → 명령 프롬프트가 열린다.
-3. `python cdp_logger.py`
+3. `python arduino_logger.py`
 4. 묻는 순서대로 입력한다.
 
 | 질문 | 예시 | 뜻 |
