@@ -1,59 +1,96 @@
-# cdp_logger.py -- 통합 스케치(stage6_integrated.ino)의 시리얼 출력을 Trial 단위 CSV로 저장
+# cdp_logger.py -- 통합 스케치(stage7_integrated_timer.ino)의 시리얼 출력을 Trial 단위 CSV로 저장
 # 실제 보드로는 검증 안 됨 (가짜 시리얼 데이터로만 시험함)
 #
+# Trial 하나 = 로봇 동작 시퀀스 한 번(114.5초). Enter를 누른 순간이 time_ms 0이고,
+# 각 행의 phase는 아래 PHASES 표에 따라 경과 시간으로 붙인다.
+#
 # 만드는 파일 (세션마다, 이어쓰기):
-#   temp_<session>.csv       trial_id,session_id,group_id,time_ms,phase,temp_C,material,water_temp_C
-#   fsr_piezo_<session>.csv  trial_id,session_id,group_id,time_ms,phase,fsr,piezo1,piezo2
-#   imu_<session>.csv        trial_id,session_id,group_id,time_ms,phase,ax,ay,az,gx,gy,gz
+#   temp_<session>.csv   trial_id,session_id,group_id,time_ms,phase,temp_C,material,water_temp_C   (2 Hz)
+#   piezo_<session>.csv  trial_id,session_id,group_id,time_ms,phase,piezo                          (4 kHz)
+#   fsr_<session>.csv    trial_id,session_id,group_id,time_ms,phase,fsr                            (100 Hz)
+#   imu_<session>.csv    trial_id,session_id,group_id,time_ms,phase,ax,ay,az,gx,gy,gz              (100 Hz)
+import bisect
 import os
 import threading
 import serial
 
 PORT = "COM3"
-CONTACT_MS = 15000          # 접촉 후 기록 시간
+PIEZO_DT_US = 250           # P 줄 안의 샘플 간격 (스케치의 TICK_US와 같아야 함)
+
+# 로봇 동작 시간표: (시작 시각 s, 이름). 로봇 쪽 시간표가 바뀌면 여기만 고친다.
+PHASES = [
+    (0.0, "open"), (3.0, "level"), (8.0, "reach_j3"), (14.0, "reach_j2"),
+    (20.0, "j4_after"), (24.0, "pre_move"), (28.0, "settle"), (30.0, "squeeze"),
+    (38.0, "hold"), (58.0, "rub_prep"), (62.0, "rub_settle"), (63.0, "rub"),
+    (81.0, "regrip"), (85.0, "regrip_hold"), (87.0, "lift"), (93.0, "lift_hold"),
+    (96.0, "shake"), (99.5, "lower"), (105.5, "release"), (108.5, "home"),
+]
+END_S = 114.5               # 마지막 동작(home)이 끝나는 시각
+
+STARTS_MS = [s * 1000 for s, _ in PHASES]
+END_MS = END_S * 1000
 
 HEADERS = {
     "T": "trial_id,session_id,group_id,time_ms,phase,temp_C,material,water_temp_C",
-    "A": "trial_id,session_id,group_id,time_ms,phase,fsr,piezo1,piezo2",
+    "P": "trial_id,session_id,group_id,time_ms,phase,piezo",
+    "A": "trial_id,session_id,group_id,time_ms,phase,fsr",
     "B": "trial_id,session_id,group_id,time_ms,phase,ax,ay,az,gx,gy,gz",
 }
-NAMES = {"T": "temp", "A": "fsr_piezo", "B": "imu"}
+NAMES = {"T": "temp", "P": "piezo", "A": "fsr", "B": "imu"}
 
-st = {"active": False, "contact_req": False}   # 읽기 스레드와 공유하는 상태
+st = {"active": False}      # 읽기 스레드와 공유하는 상태
 done = threading.Event()
 
 
+def phase_at(ms):
+    return PHASES[bisect.bisect_right(STARTS_MS, ms) - 1][1]
+
+
 def reader(ser):
+    buf = b""
     while True:
-        line = ser.readline().decode(errors="ignore").strip()
-        if not st["active"] or line[:2] not in ("A,", "B,", "T,"):
-            continue
-        f = line.split(",")
-        try:
-            t_us = int(f[1])
-        except (IndexError, ValueError):
-            continue                                   # 깨진 줄은 버림
-        kind = f[0]
-        if kind == "T":
-            if st["t0"] is None:
-                st["t0"] = t_us                        # 첫 온도 측정 = time_ms 0
-            if st["contact_req"] and st["phase"] == "baseline":
-                st["phase"], st["c0"] = "contact", t_us
-        if st["t0"] is None:
-            continue
-        ms = ((t_us - st["t0"]) & 0xFFFFFFFF) / 1000   # micros() 넘침 대비
-        ids = f'{st["trial"]},{st["session"]},{st["group"]}'
-        if kind == "T":
-            row = f'{ids},{round(ms)},{st["phase"]},{f[2]},{st["material"]},{st["water"]}'
-        else:
-            row = f'{ids},{ms:.1f},{st["phase"]},{",".join(f[2:])}'
-        st["files"][kind].write(row + "\n")
-        if kind == "T" and st["phase"] == "contact" and \
-                ((t_us - st["c0"]) & 0xFFFFFFFF) / 1000 >= CONTACT_MS - 50:
-            st["active"] = False
-            for fh in st["files"].values():
-                fh.flush()
-            done.set()
+        buf += ser.read(ser.in_waiting or 1)
+        *lines, buf = buf.split(b"\n")
+        for raw in lines:
+            handle(raw.decode(errors="ignore").strip())
+
+
+def handle(line):
+    if not st["active"] or line[:2] not in ("P,", "A,", "B,", "T,"):
+        return
+    f = line.split(",")
+    try:
+        t_us = int(f[1])
+    except (IndexError, ValueError):
+        return                                         # 깨진 줄은 버림
+    kind = f[0]
+    if st["t0"] is None:
+        st["t0"] = t_us                                # Enter 후 처음 받은 줄 = time_ms 0
+    ms = ((t_us - st["t0"]) & 0xFFFFFFFF) / 1000       # 타임스탬프 넘침 대비
+    if ms >= END_MS + 200:                             # 늦게 오는 줄을 0.2초 더 기다린 뒤 종료
+        st["active"] = False
+        for fh in st["files"].values():
+            fh.flush()
+        done.set()
+        return
+    ids = f'{st["trial"]},{st["session"]},{st["group"]}'
+    out = st["files"][kind]
+    if kind == "P":
+        for i, v in enumerate(f[2:]):
+            m = ms + i * PIEZO_DT_US / 1000
+            if m <= END_MS:
+                out.write(f"{ids},{m:.3f},{phase_at(m)},{v}\n")
+        return
+    if ms > END_MS:
+        return
+    ph = phase_at(ms)
+    if kind == "T":
+        out.write(f'{ids},{round(ms)},{ph},{f[2]},{st["material"]},{st["water"]}\n')
+        if ph != st["shown"]:                          # 진행 상황 표시 (0.5초 단위)
+            st["shown"] = ph
+            print(f"    {ms / 1000:6.1f}s  {ph}")
+    else:
+        out.write(f'{ids},{ms:.3f},{ph},{",".join(f[2:])}\n')
 
 
 def open_files(session):
@@ -97,7 +134,7 @@ def main():
             trial_no = last_trial(session)             # 같은 세션 파일이 있으면 번호 이어감
             st.update(session=session, group=group, material=material, water=water,
                       files=open_files(session))
-        k = input(f"\n[Enter] Trial T{trial_no + 1:03d} 시작 / [n] 조건 변경 / [q] 종료: ").strip().lower()
+        k = input(f"\n로봇 시퀀스 시작과 동시에 [Enter] = Trial T{trial_no + 1:03d} 시작 / [n] 조건 변경 / [q] 종료: ").strip().lower()
         if k == "q":
             break
         if k == "n":
@@ -105,11 +142,8 @@ def main():
             continue
         trial_no += 1
         done.clear()
-        st.update(trial=f"T{trial_no:03d}", phase="baseline", t0=None, c0=None,
-                  contact_req=False, active=True)
-        input("  baseline 기록 중... 컵에 대는 순간 [Enter]: ")
-        st["contact_req"] = True
-        print(f"  contact 기록 중... {CONTACT_MS // 1000}초 뒤 자동 종료")
+        st.update(trial=f"T{trial_no:03d}", t0=None, shown=None, active=True)
+        print(f"  기록 중... {END_S}초 뒤 자동 종료")
         done.wait()
         print(f"  T{trial_no:03d} 저장 완료")
     for fh in st["files"].values():
